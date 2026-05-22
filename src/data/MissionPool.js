@@ -1,0 +1,15 @@
+export const MISSION_POOL = [
+  { id: 'earn_200',    text: 'Recauda 200 monedas',              type: 'totalCoinsEarned', target: 200,   reward: 80,   icon: '🪙' },
+  { id: 'earn_1k',     text: 'Recauda 1 000 monedas',            type: 'totalCoinsEarned', target: 1000,  reward: 350,  icon: '🪙' },
+  { id: 'earn_5k',     text: 'Recauda 5 000 monedas',            type: 'totalCoinsEarned', target: 5000,  reward: 1500, icon: '🪙' },
+  { id: 'earn_20k',    text: 'Recauda 20 000 monedas',           type: 'totalCoinsEarned', target: 20000, reward: 6000, icon: '💰' },
+  { id: 'build_1',     text: 'Construye tu primera facultad',    type: 'totalBuildings',   target: 1,     reward: 50,   icon: '🏛️' },
+  { id: 'build_2',     text: 'Construye 2 facultades',           type: 'totalBuildings',   target: 2,     reward: 200,  icon: '🏛️' },
+  { id: 'build_4',     text: 'Completa el campus (4 facultades)',type: 'totalBuildings',   target: 4,     reward: 1000, icon: '🎓' },
+  { id: 'upgrade_1',   text: 'Mejora un edificio',               type: 'totalUpgrades',    target: 1,     reward: 60,   icon: '⬆️' },
+  { id: 'upgrade_5',   text: 'Mejora edificios 5 veces',         type: 'totalUpgrades',    target: 5,     reward: 400,  icon: '⬆️' },
+  { id: 'upgrade_15',  text: 'Mejora edificios 15 veces',        type: 'totalUpgrades',    target: 15,    reward: 1200, icon: '⬆️' },
+  { id: 'quiz_c3',     text: 'Responde 3 quizzes correctamente', type: 'quizCorrect',      target: 3,     reward: 200,  icon: '🧠' },
+  { id: 'quiz_c10',    text: 'Responde 10 quizzes correctamente',type: 'quizCorrect',      target: 10,    reward: 800,  icon: '🧠' },
+  { id: 'quiz_a5',     text: 'Participa en 5 eventos del campus',type: 'quizAnswered',     target: 5,     reward: 150,  icon: '📋' },
+];
