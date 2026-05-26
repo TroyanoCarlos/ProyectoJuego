@@ -1,6 +1,6 @@
 export const QUIZ_DATA = {
   sistemas: {
-    eventName: "¡Hackathon EPN!",
+    eventName: "El Hackathon EPN",
     icon: "💻",
     color: 0x5c79ff,
     questions: [

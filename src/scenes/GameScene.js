@@ -1,34 +1,33 @@
 import Phaser from 'phaser';
 import { BUILDING_TYPES } from '../data/BuildingTypes.js';
 import { DROP_SPOTS }     from '../data/DropSpots.js';
+import {
+  MAX_BUILDING_LEVEL,
+  MAX_STUDENTS_PER_BUILDING,
+  passiveCoinsPerStudent,
+  passiveCoinsPerTick,
+  studentCost,
+  upgradeCost,
+  upgradedClickIncome,
+} from '../data/Economy.js';
+import StudentManager from '../objects/StudentManager.js';
 
 const WORLD_W = 3000;
 const WORLD_H = 2200;
-
-const STUDENT_PATHS = [
-  [{x:550,y:1060},{x:900,y:1040},{x:1200,y:1020},{x:1500,y:1010},{x:1800,y:1020},{x:2100,y:1040},{x:2450,y:1060}],
-  [{x:700,y:850}, {x:1000,y:830},{x:1300,y:820},{x:1500,y:818},{x:1700,y:830},{x:2000,y:850},{x:2300,y:870}],
-  [{x:1200,y:1200},{x:1350,y:1290},{x:1500,y:1370},{x:1650,y:1290},{x:1800,y:1200}],
-  [{x:900,y:780}, {x:900,y:900},{x:900,y:1040},{x:900,y:1180}],
-  [{x:2100,y:780},{x:2100,y:900},{x:2100,y:1040},{x:2100,y:1180}],
-];
-
-const STUDENT_TYPES = [
-  { color: 0xffcc44, r: 7, spd: 320 },
-  { color: 0x44aaff, r: 7, spd: 420 },
-  { color: 0x55dd77, r: 6, spd: 280 },
-  { color: 0xff88bb, r: 6, spd: 360 },
-  { color: 0xffffff, r: 8, spd: 500 },
-];
+const DEBUG_SHOW_DROP_SPOTS = false;
 
 export default class GameScene extends Phaser.Scene {
   constructor() {
     super({ key: 'game' });
-    this._objs      = {};   // spotId → {img, selGfx, levelTxt, unclaimedTxt, progressBg, progressBar, prodTimer, progTimer}
+    this._objs      = {};   // spotId -> {img, labelBg, levelTxt, unclaimedTxt, prodTimer}
     this._dropGfx   = {};   // spotId → Graphics
     this._dropTxt   = {};   // spotId → Text
-    this._students  = [];
+    this._dropHandles = {};
+    this._dropCenterHandles = {};
+    this._studentManager = null;
     this._selectedSpot = null;
+    this._eventTimer = null;
+    this._activeEventIcon = null;
   }
 
   create() {
@@ -36,17 +35,29 @@ export default class GameScene extends Phaser.Scene {
     this._save     = this.registry.get('save');
     this._missions = this.registry.get('missions');
     this._events   = this.registry.get('events');
+    this._studentManager = new StudentManager(this, this._state, {
+      worldW: WORLD_W,
+      worldH: WORLD_H,
+      spotPts: spot => this._spotPts(spot),
+    });
 
     this._buildWorld();
     this._buildCamera();
+    this._buildDropSpotEditor();
     this._bindGameEvents();
     this._restoreFromState();
 
     // Auto-save every 60s
     this.time.addEvent({ delay: 60000, loop: true, callback: () => this._doSave() });
     // Event system scheduling
+    this.game.events.off('event:schedule');
+    this.game.events.off('event:spawn');
     this.game.events.on('event:schedule', ({ delay }) => {
-      this.time.delayedCall(delay, () => this._events.onTimerFired());
+      if (this._eventTimer) this._eventTimer.remove(false);
+      this._eventTimer = this.time.delayedCall(delay, () => {
+        this._eventTimer = null;
+        this._events.onTimerFired();
+      });
     });
     this.game.events.on('event:spawn', d => this._spawnEventIcon(d));
 
@@ -68,10 +79,11 @@ export default class GameScene extends Phaser.Scene {
       const gfx = this.add.graphics();
       this._dropGfx[spot.id] = gfx;
       this._drawSpot(spot.id, false);
+      gfx.setVisible(DEBUG_SHOW_DROP_SPOTS);
 
       const txt = this.add.text(spot.x, spot.y, 'Construir aquí', {
         fontSize: '20px', color: '#d6e0ff', fontFamily: 'Arial', fontStyle: 'bold',
-      }).setOrigin(0.5);
+      }).setOrigin(0.5).setVisible(DEBUG_SHOW_DROP_SPOTS);
       this._dropTxt[spot.id] = txt;
     });
   }
@@ -80,7 +92,7 @@ export default class GameScene extends Phaser.Scene {
     const gfx  = this._dropGfx[id];
     const spot = DROP_SPOTS.find(s => s.id === id);
     if (!gfx || !spot) return;
-    const pts = this._spotPts(spot.x, spot.y);
+    const pts = this._spotPts(spot);
     gfx.clear();
     gfx.fillStyle(hi ? 0x5c79ff : 0xffffff, hi ? 0.22 : 0.08);
     gfx.lineStyle(hi ? 4 : 3, hi ? 0xffffff : 0x9eb1ff, hi ? 0.4 : 0.25);
@@ -90,27 +102,177 @@ export default class GameScene extends Phaser.Scene {
     gfx.closePath(); gfx.fillPath(); gfx.strokePath();
   }
 
-  _spotPts(cx, cy) {
-    return [{x:cx, y:cy-145},{x:cx+230,y:cy},{x:cx,y:cy+145},{x:cx-230,y:cy}];
+  _spotPts(spot) {
+    if (spot.points) return spot.points;
+
+    const halfW = spot.halfW ?? 230;
+    const halfH = spot.halfH ?? 145;
+    return [
+      { x: spot.x, y: spot.y - halfH },
+      { x: spot.x + halfW, y: spot.y },
+      { x: spot.x, y: spot.y + halfH },
+      { x: spot.x - halfW, y: spot.y },
+    ];
   }
 
   _insideSpot(id, x, y) {
     const spot = DROP_SPOTS.find(s => s.id === id);
     if (!spot) return false;
-    return Phaser.Geom.Polygon.Contains(new Phaser.Geom.Polygon(this._spotPts(spot.x, spot.y)), x, y);
+    return Phaser.Geom.Polygon.Contains(new Phaser.Geom.Polygon(this._spotPts(spot)), x, y);
   }
 
   // ── Camera ──────────────────────────────────────────────────
 
+  _buildDropSpotEditor() {
+    if (!DEBUG_SHOW_DROP_SPOTS) return;
+
+    DROP_SPOTS.forEach(spot => {
+      if (!spot.points) spot.points = this._spotPts(spot).map(p => ({ ...p }));
+      this._dropHandles[spot.id] = spot.points.map((pt, index) => this._createDropVertexHandle(spot, pt, index));
+      this._dropCenterHandles[spot.id] = this._createDropCenterHandle(spot);
+    });
+
+    Object.defineProperty(window, 'coordenadas', {
+      configurable: true,
+      get: () => {
+        const code = this._formatDropSpotCoordinates();
+        console.log(code);
+        return code;
+      },
+    });
+  }
+
+  _createDropVertexHandle(spot, point, index) {
+    const colors = [0xff4d6d, 0x4da3ff, 0xffd34d, 0x57e389];
+    const handle = this.add.rectangle(point.x, point.y, 26, 26, colors[index], 0.95)
+      .setStrokeStyle(3, 0xffffff, 0.95)
+      .setDepth(20)
+      .setInteractive({ cursor: 'grab', draggable: true });
+
+    const label = this.add.text(point.x, point.y, `${spot.id}.${index}`, {
+      fontSize: '11px',
+      color: '#ffffff',
+      fontFamily: 'Arial',
+      fontStyle: 'bold',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(21);
+
+    this.input.setDraggable(handle);
+
+    handle.on('pointerdown', () => {
+      this.registry.set('debug-dragging-drop-vertex', true);
+      handle.setScale(1.15);
+    });
+
+    handle.on('drag', pointer => {
+      const world = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+      point.x = Math.round(world.x);
+      point.y = Math.round(world.y);
+      handle.setPosition(point.x, point.y);
+      label.setPosition(point.x, point.y);
+      this._drawSpot(spot.id, false);
+    });
+
+    handle.on('dragend', () => {
+      this.registry.set('debug-dragging-drop-vertex', false);
+      handle.setScale(1);
+      console.log(`[drop-spot:${spot.typeId}] vertice ${index}`, { x: point.x, y: point.y });
+    });
+
+    return { handle, label };
+  }
+
+  _createDropCenterHandle(spot) {
+    const handle = this.add.circle(spot.x, spot.y, 18, 0x00e5ff, 0.95)
+      .setStrokeStyle(4, 0xffffff, 0.95)
+      .setDepth(22)
+      .setInteractive({ cursor: 'grab', draggable: true });
+
+    const label = this.add.text(spot.x, spot.y - 30, `${spot.id}.C`, {
+      fontSize: '12px',
+      color: '#ffffff',
+      fontFamily: 'Arial',
+      fontStyle: 'bold',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(23);
+
+    this.input.setDraggable(handle);
+
+    handle.on('pointerdown', () => {
+      this.registry.set('debug-dragging-drop-vertex', true);
+      handle.setScale(1.15);
+    });
+
+    handle.on('drag', pointer => {
+      const world = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+      spot.x = Math.round(world.x);
+      spot.y = Math.round(world.y);
+      handle.setPosition(spot.x, spot.y);
+      label.setPosition(spot.x, spot.y - 30);
+      this._dropTxt[spot.id]?.setPosition(spot.x, spot.y);
+    });
+
+    handle.on('dragend', () => {
+      this.registry.set('debug-dragging-drop-vertex', false);
+      handle.setScale(1);
+      console.log(`[drop-spot:${spot.typeId}] centro`, { x: spot.x, y: spot.y });
+    });
+
+    return { handle, label };
+  }
+
+  _formatDropSpotCoordinates() {
+    const lines = ['export const DROP_SPOTS = ['];
+
+    DROP_SPOTS.forEach(spot => {
+      lines.push('  {');
+      lines.push(`    id: ${spot.id},`);
+      lines.push(`    typeId: '${spot.typeId}',`);
+      lines.push(`    x: ${Math.round(spot.x)},`);
+      lines.push(`    y: ${Math.round(spot.y)},`);
+      lines.push('    points: [');
+      this._spotPts(spot).forEach(point => {
+        lines.push(`      { x: ${Math.round(point.x)}, y: ${Math.round(point.y)} },`);
+      });
+      lines.push('    ],');
+      lines.push('  },');
+    });
+
+    lines.push('];');
+    return lines.join('\n');
+  }
+
+  _spotForType(typeId) {
+    return DROP_SPOTS.find(s => s.typeId === typeId);
+  }
+
+  _nextBuildingType() {
+    return BUILDING_TYPES.find(type =>
+      !Object.values(this._state.placedBuildings).some(b => b.typeId === type.id)
+    );
+  }
+
   _buildCamera() {
+    this._clampZoom();
+    this._clampCamera();
+
+    this.scale.on('resize', () => {
+      this._clampZoom();
+      this._clampCamera();
+    });
+
     this._keys = this.input.keyboard.addKeys({
       up:'W', down:'S', left:'A', right:'D',
       up2:'UP', down2:'DOWN', left2:'LEFT', right2:'RIGHT',
     });
 
     this.input.on('wheel', (ptr, objs, dx, dy) => {
+      if (this.registry.get('ui-blocking')) return;
       const cam = this.cameras.main;
-      cam.zoom = Phaser.Math.Clamp(cam.zoom - dy * 0.001, 0.3, 1.6);
+      cam.zoom = Phaser.Math.Clamp(cam.zoom - dy * 0.001, this._getMinZoom(), 1.6);
+      this._clampCamera();
     });
 
     let panStartX = 0, panStartY = 0, panning = false;
@@ -122,16 +284,17 @@ export default class GameScene extends Phaser.Scene {
       panStartY = ptr.y;
     });
     this.input.on('pointermove', ptr => {
-      if (!ptr.isDown || !panning || this.registry.get('ui-dragging')) return;
+      if (!ptr.isDown || !panning || this.registry.get('ui-dragging') || this.registry.get('debug-dragging-drop-vertex')) return;
       const cam = this.cameras.main;
       cam.scrollX -= (ptr.x - panStartX) / cam.zoom;
       cam.scrollY -= (ptr.y - panStartY) / cam.zoom;
+      this._clampCamera();
       panStartX = ptr.x; panStartY = ptr.y;
     });
     this.input.on('pointerup', () => { panning = false; });
   }
 
-  update() {
+  update(time, delta) {
     const cam = this.cameras.main;
     const spd = 6 / cam.zoom;
     const k   = this._keys;
@@ -139,6 +302,35 @@ export default class GameScene extends Phaser.Scene {
     if (k.right.isDown || k.right2.isDown) cam.scrollX += spd;
     if (k.up.isDown    || k.up2.isDown)    cam.scrollY -= spd;
     if (k.down.isDown  || k.down2.isDown)  cam.scrollY += spd;
+    this._clampCamera();
+    this._updateStudents(delta);
+  }
+
+  _getMinZoom() {
+    return Math.max(this.scale.width / WORLD_W, this.scale.height / WORLD_H);
+  }
+
+  _clampZoom() {
+    const cam = this.cameras.main;
+    cam.zoom = Phaser.Math.Clamp(cam.zoom, this._getMinZoom(), 1.6);
+  }
+
+  _clampCamera() {
+    const cam = this.cameras.main;
+    const viewW = cam.width / cam.zoom;
+    const viewH = cam.height / cam.zoom;
+
+    if (viewW >= WORLD_W) {
+      cam.scrollX = (WORLD_W - viewW) / 2;
+    } else {
+      cam.scrollX = Phaser.Math.Clamp(cam.scrollX, 0, WORLD_W - viewW);
+    }
+
+    if (viewH >= WORLD_H) {
+      cam.scrollY = (WORLD_H - viewH) / 2;
+    } else {
+      cam.scrollY = Phaser.Math.Clamp(cam.scrollY, 0, WORLD_H - viewH);
+    }
   }
 
   // ── Event bindings ──────────────────────────────────────────
@@ -147,21 +339,42 @@ export default class GameScene extends Phaser.Scene {
     const ev = this.game.events;
 
     ev.on('ui:drop-building', ({ worldX, worldY, typeId }) => {
-      for (const spot of DROP_SPOTS) {
-        if (!this._state.placedBuildings[spot.id] && this._insideSpot(spot.id, worldX, worldY)) {
-          this._placeBuilding(spot.id, typeId);
-          return;
-        }
+      const nextType = this._nextBuildingType();
+      if (nextType && nextType.id !== typeId) {
+        ev.emit('status-message', `Primero construye ${nextType.name}.`);
+        return;
       }
-      ev.emit('status-message', 'Arrastra el edificio a una zona marcada del campus.');
+
+      const spot = this._spotForType(typeId);
+      if (!spot) return;
+
+      if (this._state.placedBuildings[spot.id]) {
+        ev.emit('status-message', 'Ese edificio ya fue construido en su lugar asignado.');
+        return;
+      }
+
+      if (this._insideSpot(spot.id, worldX, worldY)) {
+        this._placeBuilding(spot.id, typeId);
+        return;
+      }
+      ev.emit('status-message', 'Arrastra el edificio a su zona marcada del campus.');
     });
 
-    ev.on('ui:drag-over', ({ worldX, worldY }) => {
+    ev.on('ui:drag-over', ({ worldX, worldY, typeId }) => {
+      const targetSpot = this._spotForType(typeId);
       DROP_SPOTS.forEach(s => {
-        if (this._state.placedBuildings[s.id]) return;
+        if (this._state.placedBuildings[s.id] || s.id !== targetSpot?.id) {
+          this._dropGfx[s.id]?.setVisible(DEBUG_SHOW_DROP_SPOTS);
+          this._dropTxt[s.id]?.setVisible(DEBUG_SHOW_DROP_SPOTS);
+          return;
+        }
         const hi = this._insideSpot(s.id, worldX, worldY);
         this._drawSpot(s.id, hi);
-        if (this._dropTxt[s.id]) this._dropTxt[s.id].setColor(hi ? '#ffffff' : '#d6e0ff');
+        this._dropGfx[s.id]?.setVisible(true);
+        if (this._dropTxt[s.id]) {
+          this._dropTxt[s.id].setVisible(true);
+          this._dropTxt[s.id].setColor(hi ? '#ffffff' : '#d6e0ff');
+        }
       });
     });
 
@@ -169,18 +382,25 @@ export default class GameScene extends Phaser.Scene {
       DROP_SPOTS.forEach(s => {
         if (!this._state.placedBuildings[s.id]) {
           this._drawSpot(s.id, false);
-          if (this._dropTxt[s.id]) this._dropTxt[s.id].setColor('#d6e0ff');
+          this._dropGfx[s.id]?.setVisible(DEBUG_SHOW_DROP_SPOTS);
+          if (this._dropTxt[s.id]) {
+            this._dropTxt[s.id].setVisible(DEBUG_SHOW_DROP_SPOTS);
+            this._dropTxt[s.id].setColor('#d6e0ff');
+          }
         }
       });
     });
 
     ev.on('ui:upgrade', ({ spotId }) => this._upgradeBuilding(spotId));
+    ev.on('ui:admit-student', ({ spotId }) => this._admitStudent(spotId));
     ev.on('ui:select',  ({ spotId }) => this._selectBuilding(spotId));
-    ev.on('ui:claim',   ({ spotId }) => this._claimCoins(spotId));
     ev.on('ui:save',    () => this._doSave(true));
     ev.on('ui:clear-save', () => {
       this.registry.get('save').clear();
+      this.registry.set('has-save', false);
+      localStorage.setItem('epn_intro_required', '1');
       this.scene.stop('ui');
+      this.scene.stop('dialogue');
       this.scene.start('boot');
     });
   }
@@ -190,12 +410,25 @@ export default class GameScene extends Phaser.Scene {
   _placeBuilding(spotId, typeId, fromSave = false) {
     const spot = DROP_SPOTS.find(s => s.id === spotId);
     const type = BUILDING_TYPES.find(t => t.id === typeId);
+    if (!spot || !type) return;
 
     if (!fromSave) this._state.coins -= type.placeCost;
 
     // Remove drop zone
     if (this._dropGfx[spotId]) { this._dropGfx[spotId].destroy(); delete this._dropGfx[spotId]; }
     if (this._dropTxt[spotId]) { this._dropTxt[spotId].destroy(); delete this._dropTxt[spotId]; }
+    if (this._dropHandles[spotId]) {
+      this._dropHandles[spotId].forEach(({ handle, label }) => {
+        handle.destroy();
+        label.destroy();
+      });
+      delete this._dropHandles[spotId];
+    }
+    if (this._dropCenterHandles[spotId]) {
+      this._dropCenterHandles[spotId].handle.destroy();
+      this._dropCenterHandles[spotId].label.destroy();
+      delete this._dropCenterHandles[spotId];
+    }
 
     // State data
     if (!fromSave) {
@@ -203,15 +436,19 @@ export default class GameScene extends Phaser.Scene {
         typeId, level: 1,
         coinsPerTick: type.coinsPerTick,
         productionInterval: type.productionInterval,
+        students: 0,
         unclaimed: 0,
       };
     }
     const bData = this._state.placedBuildings[spotId];
+    bData.students = bData.students ?? 0;
+    bData.unclaimed = 0;
 
     // ── Phaser objects ──
-    const img = this.add.image(spot.x, spot.y, 'building')
-      .setDisplaySize(300, 300).setTint(type.tint)
-      .setInteractive({ cursor: 'pointer' });
+    const img = this.add.image(spot.x, spot.y, type.texture)
+      .setDisplaySize(type.displaySize?.width ?? 300, type.displaySize?.height ?? 300).setTint(type.tint)
+      .setDepth(type.renderDepth ?? 2)
+      .setInteractive({ cursor: 'pointer', pixelPerfect: true, alphaTolerance: 1 });
 
     // Capturar la escala correcta ANTES de resetear para la animación
     const targetScaleX = img.scaleX;
@@ -222,45 +459,38 @@ export default class GameScene extends Phaser.Scene {
       this.tweens.add({ targets: img, scaleX: targetScaleX, scaleY: targetScaleY, duration: 450, ease: 'Back.easeOut' });
     }
 
-    const selGfx = this.add.graphics();
-    selGfx.lineStyle(3, 0x5c79ff, 0.8);
-    selGfx.strokeEllipse(spot.x, spot.y + 80, 220, 60);
-    selGfx.setVisible(false);
-
+    const labelBg = this.add.graphics();
     const levelTxt = this.add.text(spot.x, spot.y + 68, `Nv.1  ${type.name}`, {
-      fontSize: '15px', color: '#c8d0ff', fontFamily: 'Arial', fontStyle: 'bold',
-    }).setOrigin(0.5);
+      fontSize: '14px',
+      color: '#ffffff',
+      fontFamily: 'Arial',
+      fontStyle: 'bold',
+      align: 'center',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(5);
+    this._drawBuildingLabel(labelBg, levelTxt, type.color);
+    labelBg.setVisible(false);
+    levelTxt.setVisible(false);
 
     const unclaimedTxt = this.add.text(spot.x, spot.y - 70, '', {
       fontSize: '18px', color: '#f5c518', fontFamily: 'Arial', fontStyle: 'bold',
       stroke: '#000000', strokeThickness: 2,
-    }).setOrigin(0.5);
-
-    const progressBg  = this.add.rectangle(spot.x, spot.y - 90, 210, 10, 0x1e2844);
-    const progressBar = this.add.rectangle(spot.x - 105, spot.y - 90, 1, 8, type.color).setOrigin(0, 0.5);
-    let   progValue   = 0;
+    }).setOrigin(0.5).setDepth(5);
 
     const prodTimer = this.time.addEvent({
       delay: bData.productionInterval, loop: true,
       callback: () => {
-        bData.unclaimed += bData.coinsPerTick;
-        progValue = 0;
-        this._floatCoin(spot.x, spot.y, bData.coinsPerTick);
-        this._refreshUnclaimed(spotId);
+        const amount = this._passiveCoinsPerTick(bData);
+        if (amount <= 0) return;
+        this._addCoins(amount);
+        this._floatCoin(spot.x, spot.y, amount);
         this.game.events.emit('production-tick');
       },
     });
 
-    const progTimer = this.time.addEvent({
-      delay: 50, loop: true,
-      callback: () => {
-        progValue = Math.min(progValue + 50 / bData.productionInterval, 1);
-        progressBar.width = Math.max(1, 210 * progValue);
-      },
-    });
-
     img.on('pointerdown', () => {
-      this._claimCoins(spotId);
+      this._clickBuilding(spotId);
       this._selectBuilding(spotId);
     });
 
@@ -270,9 +500,10 @@ export default class GameScene extends Phaser.Scene {
         `${type.name} Nv.${bData.level} · ${bData.coinsPerTick}🪙/${(bData.productionInterval/1000).toFixed(1)}s`);
     });
 
-    this._objs[spotId] = { img, selGfx, levelTxt, unclaimedTxt, progressBg, progressBar, prodTimer, progTimer };
+    this._objs[spotId] = { img, labelBg, levelTxt, unclaimedTxt, prodTimer };
     if (fromSave) {
       levelTxt.setText(`Nv.${bData.level}  ${type.name}`);
+      this._drawBuildingLabel(labelBg, levelTxt, type.color);
       this._refreshUnclaimed(spotId);
     }
 
@@ -282,34 +513,67 @@ export default class GameScene extends Phaser.Scene {
       this._doSave();
       this.game.events.emit('building-placed', { spotId, typeId });
       this.game.events.emit('coins-updated');
-      this.game.events.emit('status-message', '¡Facultad construida! Haz clic en ella para reclamar monedas.');
+      this.game.events.emit('status-message', 'Facultad construida. Haz clic en ella para generar monedas.');
     }
   }
 
   // ── Coins ───────────────────────────────────────────────────
 
-  _claimCoins(spotId) {
-    const bData = this._state.placedBuildings[spotId];
-    if (!bData || bData.unclaimed <= 0) return;
+  _drawBuildingLabel(gfx, txt, color) {
+    const padX = 10;
+    const padY = 5;
+    const bounds = txt.getBounds();
+    const x = bounds.x - padX;
+    const y = bounds.y - padY;
+    const w = bounds.width + padX * 2;
+    const h = bounds.height + padY * 2;
 
-    const amount = bData.unclaimed;
-    bData.unclaimed = 0;
-    this._state.coins            += amount;
+    gfx.clear();
+    gfx.fillStyle(0x07101c, 0.78);
+    gfx.fillRoundedRect(x, y, w, h, 7);
+    gfx.lineStyle(2, color, 0.9);
+    gfx.strokeRoundedRect(x, y, w, h, 7);
+    gfx.setDepth(4);
+  }
+
+  _clickBuilding(spotId) {
+    const bData = this._state.placedBuildings[spotId];
+    if (!bData) return;
+    const amount = Math.max(1, bData.coinsPerTick);
+    this._addCoins(amount);
+    this._popText(spotId, amount);
+    this._doSave();
+  }
+
+  _addCoins(amount) {
+    this._state.coins += amount;
     this._state.totalCoinsEarned += amount;
     this._state.missions.progress.totalCoinsEarned += amount;
-
-    this._refreshUnclaimed(spotId);
-    this._popText(spotId, amount);
     this._missions.onAction('totalCoinsEarned');
-    this._doSave();
     this.game.events.emit('coins-updated');
+  }
+
+  _passiveCoinsPerStudent(bData) {
+    return passiveCoinsPerStudent(bData);
+  }
+
+  _passiveCoinsPerTick(bData) {
+    return passiveCoinsPerTick(bData);
+  }
+
+  _studentCost(type, bData) {
+    return studentCost(type, bData);
+  }
+
+  _upgradeCost(type, bData) {
+    return upgradeCost(type, bData);
   }
 
   _refreshUnclaimed(spotId) {
     const bData = this._state.placedBuildings[spotId];
     const objs  = this._objs[spotId];
     if (!bData || !objs) return;
-    objs.unclaimedTxt.setText(bData.unclaimed > 0 ? `⏳ ${bData.unclaimed}` : '');
+    objs.unclaimedTxt.setText('');
   }
 
   _popText(spotId, amount) {
@@ -318,16 +582,17 @@ export default class GameScene extends Phaser.Scene {
     const t = this.add.text(spot.x, spot.y - 80, `+${amount} 🪙`, {
       fontSize: '24px', color: '#f5c518', fontFamily: 'Orbitron, Arial', fontStyle: 'bold',
       stroke: '#000000', strokeThickness: 3,
-    }).setOrigin(0.5);
+    }).setOrigin(0.5).setDepth(80);
     this.tweens.add({ targets: t, y: t.y - 70, alpha: 0, duration: 1000, ease: 'Cubic.easeOut', onComplete: () => t.destroy() });
   }
 
   _floatCoin(x, y, amount) {
     const dx = Phaser.Math.Between(-30, 30);
-    const t  = this.add.text(x + dx, y - 130, `+${amount}`, {
-      fontSize: '16px', color: '#f5c518', fontFamily: 'Arial', fontStyle: 'bold',
-    }).setOrigin(0.5);
-    this.tweens.add({ targets: t, y: t.y - 50, alpha: 0, duration: 900, onComplete: () => t.destroy() });
+    const t  = this.add.text(x + dx, y - 100, `+${amount} 🪙`, {
+      fontSize: '24px', color: '#f5c518', fontFamily: 'Orbitron, Arial', fontStyle: 'bold',
+      stroke: '#000000', strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(80);
+    this.tweens.add({ targets: t, y: t.y - 70, alpha: 0, duration: 1000, ease: 'Cubic.easeOut', onComplete: () => t.destroy() });
   }
 
   // ── Upgrade ─────────────────────────────────────────────────
@@ -336,7 +601,12 @@ export default class GameScene extends Phaser.Scene {
     const bData = this._state.placedBuildings[spotId];
     if (!bData) return;
     const type = BUILDING_TYPES.find(t => t.id === bData.typeId);
-    const cost = type.upgradeBaseCost * bData.level;
+    if (bData.level >= MAX_BUILDING_LEVEL) {
+      this.game.events.emit('status-message', `${type.name} ya esta en el nivel maximo.`);
+      this.game.events.emit('building-selected', { spotId, bData });
+      return;
+    }
+    const cost = this._upgradeCost(type, bData);
 
     if (this._state.coins < cost) {
       this.game.events.emit('status-message', `Necesitas ${cost} 🪙 para mejorar.`);
@@ -345,8 +615,8 @@ export default class GameScene extends Phaser.Scene {
 
     this._state.coins    -= cost;
     bData.level          += 1;
-    bData.coinsPerTick    = Math.ceil(bData.coinsPerTick * 1.6);
-    bData.productionInterval = Math.max(200, Math.round(bData.productionInterval * 0.82));
+    bData.coinsPerTick    = upgradedClickIncome(bData);
+    bData.productionInterval = type.productionInterval;
     this._state.totalUpgrades++;
 
     const objs = this._objs[spotId];
@@ -356,15 +626,17 @@ export default class GameScene extends Phaser.Scene {
     objs.prodTimer = this.time.addEvent({
       delay: bData.productionInterval, loop: true,
       callback: () => {
-        bData.unclaimed += bData.coinsPerTick;
-        this._floatCoin(spot.x, spot.y, bData.coinsPerTick);
-        this._refreshUnclaimed(spotId);
+        const amount = this._passiveCoinsPerTick(bData);
+        if (amount <= 0) return;
+        this._addCoins(amount);
+        this._floatCoin(spot.x, spot.y, amount);
         this.game.events.emit('production-tick');
       },
     });
 
     objs.levelTxt.setText(`Nv.${bData.level}  ${type.name}`);
-    this.tweens.add({ targets: objs.img, alpha: 0.2, duration: 80, yoyo: true, repeat: 4 });
+    this._drawBuildingLabel(objs.labelBg, objs.levelTxt, type.color);
+    this._flashBuilding(objs.img);
 
     this._state.missions.progress.totalUpgrades = this._state.totalUpgrades;
     this._missions.onAction('totalUpgrades');
@@ -379,10 +651,54 @@ export default class GameScene extends Phaser.Scene {
 
   // ── Selection ───────────────────────────────────────────────
 
+  _admitStudent(spotId) {
+    const bData = this._state.placedBuildings[spotId];
+    if (!bData) return;
+    const type = BUILDING_TYPES.find(t => t.id === bData.typeId);
+    if ((bData.students ?? 0) >= MAX_STUDENTS_PER_BUILDING) {
+      this.game.events.emit('status-message', `${type.name} ya tiene el maximo de estudiantes.`);
+      this.game.events.emit('building-selected', { spotId, bData });
+      return;
+    }
+    const cost = this._studentCost(type, bData);
+
+    if (this._state.coins < cost) {
+      this.game.events.emit('status-message', `Necesitas ${cost} monedas para admitir estudiante.`);
+      return;
+    }
+
+    this._state.coins -= cost;
+    bData.students = (bData.students ?? 0) + 1;
+    bData.unclaimed = 0;
+
+    this._createStudents();
+    this._doSave();
+    this.game.events.emit('coins-updated');
+    this.game.events.emit('building-student-admitted', { spotId });
+    this.game.events.emit('status-message', `${type.name}: estudiante admitido.`);
+    this.game.events.emit('building-selected', { spotId, bData });
+  }
+
+  _flashBuilding(img) {
+    this.tweens.killTweensOf(img);
+    img.setAlpha(1);
+    this.tweens.add({
+      targets: img,
+      alpha: 0.35,
+      duration: 80,
+      yoyo: true,
+      repeat: 4,
+      onComplete: () => img.setAlpha(1),
+      onStop: () => img.setAlpha(1),
+    });
+  }
+
   _selectBuilding(spotId) {
     this._selectedSpot = spotId;
     Object.entries(this._objs).forEach(([id, o]) => {
-      o.selGfx.setVisible(parseInt(id) === spotId);
+      const selected = parseInt(id) === spotId;
+      o.labelBg?.setVisible(selected);
+      o.levelTxt?.setVisible(selected);
     });
     this.game.events.emit('building-selected', {
       spotId,
@@ -393,56 +709,22 @@ export default class GameScene extends Phaser.Scene {
   // ── Students ────────────────────────────────────────────────
 
   _createStudents() {
-    this._students.forEach(s => { if (s?.active) s.destroy(); });
-    this._students = [];
-    const n = Math.min(6 + Object.keys(this._state.placedBuildings).length * 3, 22);
-
-    for (let i = 0; i < n; i++) {
-      const path = STUDENT_PATHS[i % STUDENT_PATHS.length];
-      const t    = STUDENT_TYPES[Math.floor(Math.random() * STUDENT_TYPES.length)];
-      const idx  = Math.floor(Math.random() * path.length);
-      const start = path[idx];
-
-      // Use Graphics to avoid Phaser 4 Arc WebGL bug
-      const gfx = this.add.graphics();
-      gfx.fillStyle(t.color, 1);
-      gfx.fillCircle(0, 0, t.r);
-      gfx.setPosition(start.x, start.y);
-      gfx._pathData = { path, idx, reverse: Math.random() > 0.5, spd: t.spd };
-
-      this._students.push(gfx);
-      this._moveStudent(gfx);
-    }
+    this._studentManager?.sync();
   }
 
-  _moveStudent(dot) {
-    if (!dot?.active) return;
-    const d = dot._pathData;
-    const nextIdx = d.reverse ? d.idx - 1 : d.idx + 1;
-
-    if (nextIdx < 0 || nextIdx >= d.path.length) {
-      d.reverse = !d.reverse;
-      this._moveStudent(dot);
-      return;
-    }
-
-    const from = d.path[d.idx];
-    const to   = d.path[nextIdx];
-    const dist = Phaser.Math.Distance.Between(from.x, from.y, to.x, to.y);
-    d.idx      = nextIdx;
-
-    this.tweens.add({
-      targets: dot, x: to.x, y: to.y,
-      duration: dist * (d.spd + Phaser.Math.Between(-60, 60)),
-      ease: 'Linear',
-      onComplete: () => this._moveStudent(dot),
-    });
+  _updateStudents(delta = 16) {
+    this._studentManager?.update(delta);
   }
 
   // ── Campus events ────────────────────────────────────────────
 
   _spawnEventIcon({ pos, facultyId, data, question }) {
+    if (this._activeEventIcon?.active) {
+      this._activeEventIcon.destroy();
+    }
+
     const container = this.add.container(pos.x, pos.y);
+    this._activeEventIcon = container;
 
     const glow = this.add.graphics();
     glow.fillStyle(data.color, 0.18);
@@ -477,6 +759,7 @@ export default class GameScene extends Phaser.Scene {
 
     const timeout = this.time.delayedCall(12000, () => {
       if (container.active) container.destroy();
+      if (this._activeEventIcon === container) this._activeEventIcon = null;
       this._events.closeQuiz();
     });
 
@@ -485,6 +768,7 @@ export default class GameScene extends Phaser.Scene {
     hit.on('pointerdown', () => {
       timeout.remove(false);
       container.destroy();
+      if (this._activeEventIcon === container) this._activeEventIcon = null;
       this._events.openQuiz(facultyId, question);
     });
   }
@@ -511,13 +795,11 @@ export default class GameScene extends Phaser.Scene {
 
     let offline = 0;
     Object.values(this._state.placedBuildings).forEach(b => {
-      offline += Math.floor((b.coinsPerTick / (b.productionInterval / 1000)) * Math.min(elapsed, 7200));
+      offline += Math.floor((this._passiveCoinsPerTick(b) / (b.productionInterval / 1000)) * Math.min(elapsed, 7200));
     });
     if (offline > 0) {
-      this._state.coins            += offline;
-      this._state.totalCoinsEarned += offline;
+      this._addCoins(offline);
       this.game.events.emit('offline-earnings', { amount: offline, seconds: elapsed });
-      this.game.events.emit('coins-updated');
     }
   }
 
