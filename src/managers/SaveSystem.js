@@ -19,5 +19,8 @@ export default class SaveSystem {
   clear() {
     localStorage.removeItem(KEY);
     localStorage.removeItem('epn_tutorial_done');
+    localStorage.removeItem('epn_intro_done');
+    localStorage.removeItem('epn_force_intro');
+    localStorage.setItem('epn_intro_required', '1');
   }
 }

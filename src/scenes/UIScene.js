@@ -3,6 +3,14 @@ import { BUILDING_TYPES } from '../data/BuildingTypes.js';
 import { DROP_SPOTS }     from '../data/DropSpots.js';
 import { QUIZ_DATA }      from '../data/QuizData.js';
 import { fmtNumber }      from '../utils/Format.js';
+import {
+  MAX_BUILDING_LEVEL,
+  MAX_STUDENTS_PER_BUILDING,
+  passiveCoinsPerStudent,
+  studentCost,
+  upgradeCost,
+} from '../data/Economy.js';
+import { maybeShowCampusRebuiltPopup, showTutorial } from '../ui/TutorialUI.js';
 
 export default class UIScene extends Phaser.Scene {
   constructor() {
@@ -17,6 +25,8 @@ export default class UIScene extends Phaser.Scene {
     this._toastQueue    = [];
     this._toastBusy     = false;
     this._statusTimer   = null;
+    this._paletteScroll = 0;
+    this._gamePaused    = false;
   }
 
   create() {
@@ -30,10 +40,7 @@ export default class UIScene extends Phaser.Scene {
     this._bindEvents();
     this._setupDrag();
 
-    // Tutorial on first run
-    if (!localStorage.getItem('epn_tutorial_done')) {
-      this.time.delayedCall(800, () => this._showTutorial());
-    }
+    this._scheduleTutorial();
 
     this.cameras.main.fadeIn(400);
   }
@@ -67,6 +74,18 @@ export default class UIScene extends Phaser.Scene {
     saveBtn.on('pointerover', () => saveBtn.setFillStyle(0x2a3860));
     saveBtn.on('pointerout',  () => saveBtn.setFillStyle(0x1e2844));
     saveBtn.on('pointerdown', () => this.game.events.emit('ui:save'));
+
+    this._pauseBtn = this.add.rectangle(W - 190, 35, 116, 32, 0x1e2844)
+      .setStrokeStyle(1, 0x5c79ff, 0.6).setInteractive({ cursor: 'pointer' });
+    this._pauseBtnTxt = this.add.text(W - 190, 35, 'Pausar', {
+      fontSize: '13px', color: '#9eb1ff', fontFamily: 'Arial', fontStyle: 'bold',
+    }).setOrigin(0.5).setInteractive({ cursor: 'pointer' });
+    this._pauseBtn.on('pointerover', () => this._pauseBtn.setFillStyle(0x2a3860));
+    this._pauseBtn.on('pointerout',  () => this._pauseBtn.setFillStyle(0x1e2844));
+    this._pauseBtn.on('pointerdown', () => this._togglePause());
+    this._pauseBtnTxt.on('pointerdown', () => this._togglePause());
+    this._pauseBtn.setDepth(104);
+    this._pauseBtnTxt.setDepth(105);
 
     // Reset button (small, corner)
     const resetBtn = this.add.text(W - 8, 78, '↺', {
@@ -124,7 +143,18 @@ export default class UIScene extends Phaser.Scene {
 
     // Building cards
     this._cards = {};
+    const upgradeLayout = this._upgradePanelLayout();
+    this._paletteTop = 154;
+    this._paletteBottom = Math.max(this._paletteTop + 220, upgradeLayout.top - 16);
+    this._paletteContainer = this.add.container(0, 0);
+    const paletteMask = this.make.graphics({ x: 0, y: 0, add: false });
+    paletteMask.fillStyle(0xffffff);
+    paletteMask.fillRect(0, this._paletteTop, SW, this._paletteBottom - this._paletteTop);
+    this._paletteContainer.setMask(paletteMask.createGeometryMask());
+    this._sidebar.add(this._paletteContainer);
+
     BUILDING_TYPES.forEach((type, i) => this._buildCard(type, i));
+    this._bindPaletteScroll();
 
     // Upgrade panel
     this._buildUpgradePanel();
@@ -134,32 +164,36 @@ export default class UIScene extends Phaser.Scene {
 
   _buildCard(type, index) {
     const SW  = this._sidebarW;
-    const cy  = 192 + index * 125;
+    const cy  = 190 + index * 88;
     const affordable = this._state.coins >= type.placeCost;
+    const built = this._isBuildingTypeBuilt(type.id);
+    const nextInOrder = this._isNextBuildingType(type.id);
+    const enabled = affordable && !built && nextInOrder;
 
-    const card = this.add.rectangle(SW / 2, cy, 268, 110, 0x111826)
-      .setStrokeStyle(2, type.color, affordable ? 0.5 : 0.12);
+    const card = this.add.rectangle(SW / 2, cy, 268, 78, 0x111826)
+      .setStrokeStyle(2, type.color, enabled ? 0.5 : 0.12);
 
-    const nameTxt = this.add.text(14, cy - 40, type.name, {
-      fontSize: '13px', color: affordable ? '#ffffff' : '#3a4460',
+    const nameTxt = this.add.text(14, cy - 28, type.name, {
+      fontSize: '12px', color: enabled ? '#ffffff' : '#3a4460',
       fontFamily: 'Arial', fontStyle: 'bold', wordWrap: { width: 168 },
     }).setOrigin(0, 0.5);
 
-    const descTxt = this.add.text(14, cy - 8, type.description, {
-      fontSize: '11px', color: affordable ? '#7a8ab0' : '#2a3040', fontFamily: 'Arial',
+    const descTxt = this.add.text(14, cy - 2, type.description, {
+      fontSize: '11px', color: enabled ? '#7a8ab0' : '#2a3040', fontFamily: 'Arial',
     }).setOrigin(0, 0.5);
 
-    const costColor = type.placeCost === 0 ? '#55dd77' : affordable ? '#f5c518' : '#cc4444';
+    const costColor = built ? '#4a5a7a' : type.placeCost === 0 ? '#55dd77' : affordable ? '#f5c518' : '#cc4444';
     const costLabel = type.placeCost === 0 ? '✓ Gratis' : `Costo: ${fmtNumber(type.placeCost)} 🪙`;
-    const costTxt = this.add.text(14, cy + 18, costLabel, {
+    const costTxt = this.add.text(14, cy + 22, costLabel, {
       fontSize: '12px', color: costColor, fontFamily: 'Arial', fontStyle: 'bold',
     }).setOrigin(0, 0.5);
+    if (built) costTxt.setText('Construido');
 
     // Drag handle image (right side of card)
-    const img = this.add.image(SW - 44, cy, 'building')
-      .setDisplaySize(82, 82).setTint(type.tint)
-      .setAlpha(affordable ? 1 : 0.25)
-      .setInteractive({ cursor: affordable ? 'grab' : 'not-allowed' });
+    const img = this.add.image(SW - 44, cy, type.texture)
+      .setDisplaySize(64, 64).setTint(type.tint)
+      .setAlpha(enabled ? 1 : 0.25)
+      .setInteractive({ cursor: enabled ? 'grab' : 'not-allowed' });
 
     img._typeId = type.id;
     img._homeX  = SW - 44;
@@ -167,6 +201,15 @@ export default class UIScene extends Phaser.Scene {
 
     // Drag via pointerdown on img
     img.on('pointerdown', (ptr) => {
+      if (this._isBuildingTypeBuilt(type.id)) {
+        this._setStatus(`${type.name} ya fue construido.`, 3000);
+        return;
+      }
+      if (!this._isNextBuildingType(type.id)) {
+        const next = this._nextBuildingType();
+        this._setStatus(`Primero construye ${next?.name ?? 'el edificio anterior'}.`, 3000);
+        return;
+      }
       if (this._state.coins < type.placeCost) {
         this._setStatus(`Necesitas ${fmtNumber(type.placeCost)} 🪙 para construir ${type.name}.`, 3000);
         return;
@@ -174,8 +217,77 @@ export default class UIScene extends Phaser.Scene {
       this._startDrag(type.id, ptr);
     });
 
-    this._sidebar.add([card, nameTxt, descTxt, costTxt, img]);
+    this._paletteContainer.add([card, nameTxt, descTxt, costTxt, img]);
     this._cards[type.id] = { card, nameTxt, descTxt, costTxt, img };
+  }
+
+  _togglePause() {
+    this._gamePaused = !this._gamePaused;
+    const music = this.registry.get('game-music');
+
+    if (this._gamePaused) {
+      this.scene.pause('game');
+      music?.pause();
+      this._showPauseOverlay();
+      this._pauseBtnTxt.setText('Reanudar').setColor('#ffffff');
+      this._setStatus('Juego pausado.', 0);
+      return;
+    }
+
+    this.scene.resume('game');
+    music?.resume();
+    this._hidePauseOverlay();
+    this._pauseBtnTxt.setText('Pausar').setColor('#9eb1ff');
+    this._setStatus('Juego reanudado.', 2500);
+  }
+
+  _showPauseOverlay() {
+    if (this._pauseOverlay?.length) return;
+    const { width: W, height: H } = this.scale;
+    const cx = W / 2;
+    const cy = H / 2;
+    this._pauseOverlay = [
+      this.add.rectangle(cx, cy, W, H, 0x000000, 0.58)
+        .setDepth(100)
+        .setInteractive(),
+      this.add.text(cx, cy - 24, 'Ⅱ', {
+        fontSize: '96px',
+        fontFamily: 'Arial',
+        fontStyle: 'bold',
+        color: '#ffffff',
+        stroke: '#000000',
+        strokeThickness: 8,
+      }).setOrigin(0.5).setDepth(101),
+      this.add.text(cx, cy + 58, 'PAUSA', {
+        fontSize: '24px',
+        fontFamily: 'Orbitron, Arial',
+        fontStyle: 'bold',
+        color: '#f5c518',
+        stroke: '#000000',
+        strokeThickness: 4,
+      }).setOrigin(0.5).setDepth(101),
+    ];
+    this.children.bringToTop(this._pauseBtn);
+    this.children.bringToTop(this._pauseBtnTxt);
+  }
+
+  _hidePauseOverlay() {
+    this._pauseOverlay?.forEach(obj => {
+      if (obj?.active) obj.destroy();
+    });
+    this._pauseOverlay = null;
+  }
+
+  _bindPaletteScroll() {
+    this.input.on('wheel', (ptr, objs, dx, dy) => {
+      const paletteTop = this._paletteTop ?? 154;
+      const paletteBottom = this._paletteBottom ?? 614;
+      if (!this._sidebarOpen || ptr.x > this._sidebarW || ptr.y < paletteTop || ptr.y > paletteBottom) return;
+      const contentBottom = 190 + (BUILDING_TYPES.length - 1) * 88 + 39;
+      const maxScroll = Math.max(0, contentBottom - paletteBottom);
+      this._paletteScroll = Phaser.Math.Clamp(this._paletteScroll + dy * 0.5, 0, maxScroll);
+      this._paletteContainer.y = -this._paletteScroll;
+    });
   }
 
   _updateBuildingCards() {
@@ -184,20 +296,40 @@ export default class UIScene extends Phaser.Scene {
       const c = this._cards[type.id];
       if (!c) return;
       const affordable = this._state.coins >= type.placeCost;
-      c.costTxt.setColor(type.placeCost === 0 ? '#55dd77' : affordable ? '#f5c518' : '#cc4444');
-      c.nameTxt.setColor(affordable ? '#ffffff' : '#3a4460');
-      c.descTxt.setColor(affordable ? '#7a8ab0' : '#2a3040');
-      c.img.setAlpha(affordable ? 1 : 0.25);
-      c.card.setStrokeStyle(2, type.color, affordable ? 0.5 : 0.12);
+      const built = this._isBuildingTypeBuilt(type.id);
+      const nextInOrder = this._isNextBuildingType(type.id);
+      const enabled = affordable && !built && nextInOrder;
+      if (built) c.costTxt.setText('Construido');
+      c.costTxt.setColor(built ? '#4a5a7a' : type.placeCost === 0 ? '#55dd77' : affordable ? '#f5c518' : '#cc4444');
+      c.nameTxt.setColor(enabled ? '#ffffff' : '#3a4460');
+      c.descTxt.setColor(enabled ? '#7a8ab0' : '#2a3040');
+      c.img.setAlpha(enabled ? 1 : 0.25);
+      c.img.input.cursor = enabled ? 'grab' : 'not-allowed';
+      c.card.setStrokeStyle(2, type.color, enabled ? 0.5 : 0.12);
     });
+  }
+
+  _isBuildingTypeBuilt(typeId) {
+    return Object.values(this._state.placedBuildings).some(b => b.typeId === typeId);
+  }
+
+  _nextBuildingType() {
+    return BUILDING_TYPES.find(type => !this._isBuildingTypeBuilt(type.id));
+  }
+
+  _isNextBuildingType(typeId) {
+    const next = this._nextBuildingType();
+    return !next || next.id === typeId;
   }
 
   _buildUpgradePanel() {
     const SW = this._sidebarW;
-    const cy = 710;
+    const { cy } = this._upgradePanelLayout();
 
-    this.add.rectangle(SW / 2, cy - 38, 260, 1, 0x5c79ff, 0.2);
-    this.add.text(SW / 2, cy - 20, 'MEJORAR EDIFICIO', {
+    const panelBg = this.add.rectangle(SW / 2, cy + 48, SW - 8, 250, 0x0d1220, 1)
+      .setStrokeStyle(1, 0x5c79ff, 0.12);
+    const div = this.add.rectangle(SW / 2, cy - 38, 260, 1, 0x5c79ff, 0.2);
+    const title = this.add.text(SW / 2, cy - 20, 'MEJORAR EDIFICIO', {
       fontSize: '12px', fontFamily: 'Orbitron, Arial', color: '#4a5a7a', fontStyle: 'bold',
     }).setOrigin(0.5);
 
@@ -215,7 +347,21 @@ export default class UIScene extends Phaser.Scene {
       fontSize: '14px', color: '#3a4460', fontFamily: 'Arial', fontStyle: 'bold',
     }).setOrigin(0.5).setInteractive({ cursor: 'pointer' });
 
-    this._sidebar.add([this._upgInfoTxt, this._upgCostTxt, this._upgBtn, this._upgBtnTxt]);
+    this._studentCostTxt = this.add.text(SW / 2, cy + 124, '', {
+      fontSize: '12px', color: '#7a8ab0', fontFamily: 'Arial', fontStyle: 'bold',
+      align: 'center',
+    }).setOrigin(0.5);
+
+    this._studentBtn = this.add.rectangle(SW / 2, cy + 156, 220, 36, 0x1a2540)
+      .setStrokeStyle(2, 0x55dd77, 0.35).setInteractive({ cursor: 'pointer' });
+    this._studentBtnTxt = this.add.text(SW / 2, cy + 156, 'Admitir estudiante', {
+      fontSize: '13px', color: '#3a4460', fontFamily: 'Arial', fontStyle: 'bold',
+    }).setOrigin(0.5).setInteractive({ cursor: 'pointer' });
+
+    this._sidebar.add([
+      panelBg, div, title, this._upgInfoTxt, this._upgCostTxt, this._upgBtn, this._upgBtnTxt,
+      this._studentCostTxt, this._studentBtn, this._studentBtnTxt,
+    ]);
 
     this._upgBtn.on('pointerover', () => { if (this._selectedSpot !== null) this._upgBtn.setFillStyle(0x2a3860); });
     this._upgBtn.on('pointerout',  () => this._upgBtn.setFillStyle(0x1a2540));
@@ -225,6 +371,24 @@ export default class UIScene extends Phaser.Scene {
     this._upgBtnTxt.on('pointerdown', () => {
       if (this._selectedSpot !== null) this.game.events.emit('ui:upgrade', { spotId: this._selectedSpot });
     });
+    this._studentBtn.on('pointerover', () => { if (this._selectedSpot !== null) this._studentBtn.setFillStyle(0x20304a); });
+    this._studentBtn.on('pointerout',  () => this._studentBtn.setFillStyle(0x1a2540));
+    this._studentBtn.on('pointerdown', () => {
+      if (this._selectedSpot !== null) this.game.events.emit('ui:admit-student', { spotId: this._selectedSpot });
+    });
+    this._studentBtnTxt.on('pointerdown', () => {
+      if (this._selectedSpot !== null) this.game.events.emit('ui:admit-student', { spotId: this._selectedSpot });
+    });
+  }
+
+  _upgradePanelLayout() {
+    const panelBottom = Math.min(this.scale.height - 22, 858);
+    const cy = panelBottom - 174;
+    return {
+      cy,
+      top: cy - 77,
+      bottom: cy + 173,
+    };
   }
 
   _updateUpgradePanel() {
@@ -233,16 +397,41 @@ export default class UIScene extends Phaser.Scene {
       this._upgInfoTxt.setText('Haz clic en\nun edificio del campus').setColor('#3a4460');
       this._upgCostTxt.setText('');
       this._upgBtnTxt.setText('Selecciona un edificio').setColor('#3a4460');
+      this._studentCostTxt?.setText('');
+      this._studentBtnTxt?.setText('Admitir estudiante').setColor('#3a4460');
       return;
     }
+
     const bData = this._state.placedBuildings[this._selectedSpot];
     if (!bData) return;
     const type = BUILDING_TYPES.find(t => t.id === bData.typeId);
-    const cost = type.upgradeBaseCost * bData.level;
+    const students = bData.students ?? 0;
+    const perStudent = passiveCoinsPerStudent(bData);
+    const passivePerTick = students * perStudent;
+    const passivePerSec = passivePerTick / (bData.productionInterval / 1000);
+    const nextStudentCost = studentCost(type, bData);
+    const maxStudents = students >= MAX_STUDENTS_PER_BUILDING;
+    const canStudent = !maxStudents && this._state.coins >= nextStudentCost;
+
+    this._upgInfoTxt.setText(
+      `${type.name}\nNv.${bData.level} | Clic +${fmtNumber(bData.coinsPerTick)} | Est. ${students}\nPasivo ${passivePerSec.toFixed(1)}/s`
+    ).setColor('#c8d0ff');
+    this._studentCostTxt.setText(maxStudents
+      ? `Maximo de estudiantes: ${MAX_STUDENTS_PER_BUILDING}`
+      : `Admitir: ${fmtNumber(nextStudentCost)} monedas | +${fmtNumber(perStudent)} por ciclo`
+    ).setColor(maxStudents ? '#55dd77' : canStudent ? '#55dd77' : '#cc4444');
+    this._studentBtnTxt.setText(maxStudents ? 'Maximo alcanzado' : 'Admitir estudiante').setColor(canStudent ? '#ffffff' : '#3a4460');
+
+    if (bData.level >= MAX_BUILDING_LEVEL) {
+      this._upgCostTxt.setText('Nivel maximo alcanzado').setColor('#55dd77');
+      this._upgBtnTxt.setText('Nivel maximo').setColor('#3a4460');
+      return;
+    }
+
+    const cost = upgradeCost(type, bData);
     const can  = this._state.coins >= cost;
-    this._upgInfoTxt.setText(`${type.name}\nNivel ${bData.level}  ·  ${bData.coinsPerTick}🪙/${(bData.productionInterval/1000).toFixed(1)}s`).setColor('#c8d0ff');
-    this._upgCostTxt.setText(`Costo mejora: ${fmtNumber(cost)} 🪙`).setColor(can ? '#f5c518' : '#cc4444');
-    this._upgBtnTxt.setText(`⬆ Mejorar → Nv.${bData.level + 1}`).setColor(can ? '#ffffff' : '#3a4460');
+    this._upgCostTxt.setText(`Costo mejora: ${fmtNumber(cost)} monedas`).setColor(can ? '#f5c518' : '#cc4444');
+    this._upgBtnTxt.setText(`Mejorar -> Nv.${bData.level + 1}`).setColor(can ? '#ffffff' : '#3a4460');
   }
 
   _toggleSidebar() {
@@ -263,7 +452,7 @@ export default class UIScene extends Phaser.Scene {
       this._ghost.setPosition(ptr.x, ptr.y);
       const gameScene = this.scene.get('game');
       const wp = gameScene.getWorldPoint(ptr.x, ptr.y);
-      this.game.events.emit('ui:drag-over', { worldX: wp.x, worldY: wp.y });
+      this.game.events.emit('ui:drag-over', { worldX: wp.x, worldY: wp.y, typeId: this._dragging });
     });
 
     this.input.on('pointerup', ptr => {
@@ -284,7 +473,7 @@ export default class UIScene extends Phaser.Scene {
     this._dragging = typeId;
     this.registry.set('ui-dragging', true);
 
-    this._ghost = this.add.image(ptr.x, ptr.y, 'building')
+    this._ghost = this.add.image(ptr.x, ptr.y, type.texture)
       .setDisplaySize(80, 80).setTint(type.tint).setAlpha(0.7).setDepth(100);
   }
 
@@ -372,7 +561,7 @@ export default class UIScene extends Phaser.Scene {
     if (this._quizOpen) return;
     this._quizOpen = true;
     const { width: W, height: H } = this.scale;
-    const data = QUIZ_DATA[facultyId];
+    const data = QUIZ_DATA[facultyId] ?? QUIZ_DATA.sistemas;
     const placed = Object.values(this._state.placedBuildings).find(b => b.typeId === facultyId);
     const bonus  = placed ? 50 * placed.level : 50;
     const objs   = [];
@@ -509,7 +698,34 @@ export default class UIScene extends Phaser.Scene {
 
   // ────────────────────────────── TUTORIAL ──────────────────────────────
 
+  _maybeShowCampusRebuiltPopup() {
+    maybeShowCampusRebuiltPopup(this);
+  }
+
+  _showCampusRebuiltPopup() {
+    maybeShowCampusRebuiltPopup(this);
+  }
+
+  _scheduleTutorial() {
+    if (localStorage.getItem('epn_tutorial_done') && !this.registry.get('tutorial-after-intro')) return;
+    if (this.registry.get('intro-pending')) {
+      this.game.events.once('intro-finished', () => {
+        this.time.delayedCall(450, () => showTutorial(this));
+      });
+      return;
+    }
+    this.time.delayedCall(800, () => showTutorial(this));
+  }
+
+  _currentTutorialSteps() {
+    return [];
+  }
+
   _showTutorial() {
+    return showTutorial(this);
+    if ((localStorage.getItem('epn_tutorial_done') && !this.registry.get('tutorial-after-intro')) || this._tutorialOpen) return;
+    this.registry.set('tutorial-after-intro', false);
+    this._tutorialOpen = true;
     const { width: W, height: H } = this.scale;
     const cx = W / 2, cy = H / 2;
     const steps = [
@@ -519,23 +735,24 @@ export default class UIScene extends Phaser.Scene {
       { title: 'Quizzes Académicos 🧠', text: 'Cada cierto tiempo aparece un evento\nen el campus. ¡Responde correctamente\ny gana monedas bonus!' },
       { title: 'Mejora y Expande', text: 'Selecciona un edificio y usa "Mejorar"\npara aumentar su producción.\nCompleta misiones para más recompensas.' },
     ];
+    steps.splice(0, steps.length, ...this._currentTutorialSteps());
     let step = 0;
     const objs = [];
     const add = o => { objs.push(o); return o; };
 
     add(this.add.rectangle(cx, cy, W, H, 0x000000, 0.65).setDepth(90));
-    add(this.add.rectangle(cx, cy, 440, 250, 0x0d1220).setStrokeStyle(2, 0x5c79ff, 0.8).setDepth(91));
+    add(this.add.rectangle(cx, cy, 500, 290, 0x0d1220).setStrokeStyle(2, 0x5c79ff, 0.8).setDepth(91));
     const titleTxt = add(this.add.text(cx, cy - 88, steps[0].title, {
       fontSize: '18px', fontFamily: 'Orbitron, Arial', fontStyle: 'bold', color: '#ffffff',
     }).setOrigin(0.5).setDepth(92));
     const bodyTxt = add(this.add.text(cx, cy - 20, steps[0].text, {
       fontSize: '14px', color: '#c8d0ff', fontFamily: 'Arial', align: 'center', lineSpacing: 6,
     }).setOrigin(0.5).setDepth(92));
-    const indicator = add(this.add.text(cx, cy + 58, '1 / 5', {
+    const indicator = add(this.add.text(cx, cy + 78, `1 / ${steps.length}`, {
       fontSize: '12px', color: '#4a5a7a', fontFamily: 'Arial',
     }).setOrigin(0.5).setDepth(92));
-    const btn = add(this.add.rectangle(cx, cy + 90, 180, 38, 0x5c79ff).setInteractive({ cursor: 'pointer' }).setDepth(92));
-    const btnTxt = add(this.add.text(cx, cy + 90, 'Siguiente →', {
+    const btn = add(this.add.rectangle(cx, cy + 112, 180, 38, 0x5c79ff).setInteractive({ cursor: 'pointer' }).setDepth(92));
+    const btnTxt = add(this.add.text(cx, cy + 112, 'Siguiente ->', {
       fontSize: '15px', color: '#ffffff', fontFamily: 'Arial', fontStyle: 'bold',
     }).setOrigin(0.5).setInteractive({ cursor: 'pointer' }).setDepth(93));
 
@@ -544,12 +761,13 @@ export default class UIScene extends Phaser.Scene {
       if (step >= steps.length) {
         objs.forEach(o => { if (o?.active) o.destroy(); });
         localStorage.setItem('epn_tutorial_done', '1');
+        this._tutorialOpen = false;
         return;
       }
       titleTxt.setText(steps[step].title);
       bodyTxt.setText(steps[step].text);
       indicator.setText(`${step + 1} / ${steps.length}`);
-      if (step === steps.length - 1) btnTxt.setText('¡Empezar!');
+      if (step === steps.length - 1) btnTxt.setText('Empezar');
     };
     btn.on('pointerdown', advance); btnTxt.on('pointerdown', advance);
   }
@@ -586,7 +804,10 @@ export default class UIScene extends Phaser.Scene {
 
     ev.on('coins-updated',    () => this._updateHUD());
     ev.on('production-tick',  () => this._updateHUD());
-    ev.on('building-placed',  () => this._updateHUD());
+    ev.on('building-placed',  () => {
+      this._updateHUD();
+      this._maybeShowCampusRebuiltPopup();
+    });
     ev.on('building-upgraded',() => this._updateHUD());
     ev.on('mission-done',     m  => {
       this._updateMissionsPanel();
